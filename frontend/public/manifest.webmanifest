@@ -1,0 +1,10 @@
+{
+  "name": "SnapCart BYOD",
+  "short_name": "SnapCart",
+  "description": "Staff-less grocery checkout prototype",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f8efe2",
+  "theme_color": "#f8efe2",
+  "icons": []
+}
