@@ -8,6 +8,8 @@ type CartItem = {
   price: number;
   quantity: number;
   line_total: number;
+  max_confidence?: number;
+  avg_confidence?: number;
 };
 
 type AssistantMessage = {
@@ -17,6 +19,48 @@ type AssistantMessage = {
 
 const BACKEND = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";
 
+function toLineTotal(price: number, quantity: number): number {
+  return Math.round(price * quantity * 100) / 100;
+}
+
+function normalizeItem(item: CartItem): CartItem {
+  return {
+    ...item,
+    quantity: Math.max(1, Number(item.quantity) || 1),
+    line_total: toLineTotal(Number(item.price) || 0, Math.max(1, Number(item.quantity) || 1)),
+  };
+}
+
+function mergeCartItems(current: CartItem[], incoming: CartItem[]): CartItem[] {
+  const map = new Map<string, CartItem>();
+
+  for (const baseItem of current) {
+    const item = normalizeItem(baseItem);
+    map.set(item.class_name, item);
+  }
+
+  for (const incomingItem of incoming) {
+    const item = normalizeItem(incomingItem);
+    const existing = map.get(item.class_name);
+    if (!existing) {
+      map.set(item.class_name, item);
+      continue;
+    }
+
+    const quantity = existing.quantity + item.quantity;
+    const price = item.price || existing.price;
+    map.set(item.class_name, {
+      class_name: item.class_name,
+      name: item.name || existing.name,
+      price,
+      quantity,
+      line_total: toLineTotal(price, quantity),
+    });
+  }
+
+  return Array.from(map.values());
+}
+
 export default function Home() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -24,6 +68,8 @@ export default function Home() {
   const [cameraReady, setCameraReady] = useState(false);
   const [busy, setBusy] = useState(false);
   const [cart, setCart] = useState<CartItem[]>([]);
+  const [pendingScanItems, setPendingScanItems] = useState<CartItem[]>([]);
+  const [isConfirmOpen, setIsConfirmOpen] = useState(false);
   const [status, setStatus] = useState("Point your camera at your basket and tap Scan.");
   const [slipStatus, setSlipStatus] = useState<string>("");
   const [assistantInput, setAssistantInput] = useState("");
@@ -65,8 +111,66 @@ export default function Home() {
     [cart],
   );
 
+  const pendingTotal = useMemo(
+    () => pendingScanItems.reduce((sum, item) => sum + item.line_total, 0),
+    [pendingScanItems],
+  );
+
+  function adjustPendingQuantity(className: string, delta: number) {
+    setPendingScanItems((prev) =>
+      prev
+        .map((item) => {
+          if (item.class_name !== className) return item;
+          const nextQty = item.quantity + delta;
+          if (nextQty <= 0) return null;
+          return {
+            ...item,
+            quantity: nextQty,
+            line_total: toLineTotal(item.price, nextQty),
+          };
+        })
+        .filter((item): item is CartItem => item !== null),
+    );
+  }
+
+  function adjustCartQuantity(className: string, delta: number) {
+    setCart((prev) =>
+      prev
+        .map((item) => {
+          if (item.class_name !== className) return item;
+          const nextQty = item.quantity + delta;
+          if (nextQty <= 0) return null;
+          return {
+            ...item,
+            quantity: nextQty,
+            line_total: toLineTotal(item.price, nextQty),
+          };
+        })
+        .filter((item): item is CartItem => item !== null),
+    );
+  }
+
+  function cancelPendingScan() {
+    setPendingScanItems([]);
+    setIsConfirmOpen(false);
+    setStatus("Scan discarded. Scan again when ready.");
+  }
+
+  function acceptPendingScan() {
+    if (pendingScanItems.length === 0) {
+      setIsConfirmOpen(false);
+      return;
+    }
+
+    setCart((prev) => mergeCartItems(prev, pendingScanItems));
+    setPendingScanItems([]);
+    setIsConfirmOpen(false);
+    setStatus("Items confirmed and added to cart.");
+    setSuccess(false);
+  }
+
   async function captureAndScan() {
-    if (!videoRef.current || !canvasRef.current || busy) return;
+    if (!videoRef.current || !canvasRef.current || busy || isConfirmOpen) return;
 
     setBusy(true);
     setStatus("Analyzing snapshot...");
@@ -100,9 +204,17 @@ export default function Home() {
       }
 
       const data = await response.json();
-      const items: CartItem[] = Array.isArray(data.items) ? data.items : [];
-      setCart(items);
-      setStatus(items.length ? "Cart updated." : "No products detected. Try another angle.");
+      const items: CartItem[] = Array.isArray(data.items)
+        ? (data.items as CartItem[]).map((item) => normalizeItem(item))
+        : [];
+
+      if (items.length === 0) {
+        setStatus("No new product detected. Try another angle. Existing cart remains unchanged.");
+      } else {
+        setPendingScanItems(items);
+        setIsConfirmOpen(true);
+        setStatus("Review scan result before adding to cart.");
+      }
       setSuccess(false);
     } catch (err) {
       setStatus(`Scan failed: ${String(err)}`);
@@ -174,6 +286,75 @@ export default function Home() {
 
   return (
     <main className="mx-auto max-w-6xl px-4 py-6 md:px-8 md:py-10">
+      {isConfirmOpen ? (
+        <section className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
+          <div className="card w-full max-w-lg p-4 md:p-5">
+            <h2 className="text-2xl font-bold">Confirm Detected Items</h2>
+            <p className="mt-1 text-sm text-ink/80">
+              Please confirm the item and quantity before adding to cart.
+            </p>
+
+            <div className="mt-4 space-y-2">
+              {pendingScanItems.map((item) => (
+                <div
+                  key={`pending-${item.class_name}`}
+                  className="rounded-lg border border-ink/10 bg-white px-3 py-2"
+                >
+                  <div className="flex items-center justify-between">
+                    <p className="font-semibold">{item.name}</p>
+                    <p className="font-bold">{item.price.toFixed(2)} THB</p>
+                  </div>
+                  {typeof item.max_confidence === "number" ? (
+                    <p className="mt-1 text-xs text-ink/70">
+                      Confidence: {(item.max_confidence * 100).toFixed(1)}%
+                    </p>
+                  ) : null}
+                  <div className="mt-2 flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={() => adjustPendingQuantity(item.class_name, -1)}
+                        className="rounded-md border border-ink/20 px-3 py-1 font-bold"
+                      >
+                        -
+                      </button>
+                      <span className="min-w-10 text-center font-semibold">{item.quantity}</span>
+                      <button
+                        onClick={() => adjustPendingQuantity(item.class_name, 1)}
+                        className="rounded-md border border-ink/20 px-3 py-1 font-bold"
+                      >
+                        +
+                      </button>
+                    </div>
+                    <p className="text-sm font-semibold">{item.line_total.toFixed(2)} THB</p>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <div className="mt-4 rounded-xl border border-ink/10 bg-[#f7efe7] p-3">
+              <p className="text-sm uppercase text-ink/70">This Scan Total</p>
+              <p className="text-2xl font-bold">{pendingTotal.toFixed(2)} THB</p>
+            </div>
+
+            <div className="mt-4 flex gap-2">
+              <button
+                onClick={cancelPendingScan}
+                className="w-full rounded-xl border border-ink/20 bg-white px-4 py-2 font-semibold"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={acceptPendingScan}
+                disabled={pendingScanItems.length === 0}
+                className="w-full rounded-xl bg-ember px-4 py-2 font-bold text-white disabled:cursor-not-allowed disabled:bg-ember/60"
+              >
+                Accept To Cart
+              </button>
+            </div>
+          </div>
+        </section>
+      ) : null}
+
       <section className="mb-6 animate-rise rounded-3xl border border-ink/10 bg-[#fff4e6] p-5 md:p-7">
         <h1 className="text-3xl font-bold md:text-5xl">SnapCart</h1>
         <p className="mt-2 max-w-2xl text-sm md:text-base">
@@ -206,7 +387,7 @@ export default function Home() {
 
           <button
             onClick={captureAndScan}
-            disabled={!cameraReady || busy}
+            disabled={!cameraReady || busy || isConfirmOpen}
             className="mt-4 w-full rounded-xl bg-ember px-4 py-3 font-bold text-white disabled:cursor-not-allowed disabled:bg-ember/60"
           >
             {busy ? "Scanning..." : "Scan Cart Snapshot"}
@@ -224,7 +405,21 @@ export default function Home() {
               >
                 <div>
                   <p className="font-semibold">{item.name}</p>
-                  <p className="text-xs text-ink/70">Qty {item.quantity}</p>
+                  <div className="mt-1 flex items-center gap-2">
+                    <button
+                      onClick={() => adjustCartQuantity(item.class_name, -1)}
+                      className="rounded-md border border-ink/20 px-2 py-0.5 text-sm font-bold"
+                    >
+                      -
+                    </button>
+                    <span className="min-w-8 text-center text-xs font-semibold">Qty {item.quantity}</span>
+                    <button
+                      onClick={() => adjustCartQuantity(item.class_name, 1)}
+                      className="rounded-md border border-ink/20 px-2 py-0.5 text-sm font-bold"
+                    >
+                      +
+                    </button>
+                  </div>
                 </div>
                 <p className="font-bold">{item.line_total.toFixed(2)} THB</p>
               </div>

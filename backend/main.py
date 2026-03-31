@@ -145,24 +145,52 @@ async def scan_cart(file: UploadFile = File(...)) -> JSONResponse:
     if image is None:
         raise HTTPException(status_code=400, detail="Failed to decode image.")
 
-    results = yolo_model(image, conf=0.6)
+    detect_conf_threshold = float(os.getenv("SCAN_CONFIDENCE_THRESHOLD", "0.80"))
+    min_box_area_ratio = float(os.getenv("SCAN_MIN_BOX_AREA_RATIO", "0.008"))
+    max_box_area_ratio = float(os.getenv("SCAN_MAX_BOX_AREA_RATIO", "0.45"))
+    image_height, image_width = image.shape[:2]
+    image_area = max(image_height * image_width, 1)
+
+    results = yolo_model(image, conf=detect_conf_threshold)
     detected_classes: list[str] = []
+    class_confidences: dict[str, list[float]] = {}
 
     for result in results:
         names_map = result.names
         if result.boxes is None:
             continue
         class_ids = result.boxes.cls.tolist() if result.boxes.cls is not None else []
-        for cls_id in class_ids:
+        confidences = result.boxes.conf.tolist() if result.boxes.conf is not None else []
+        xyxy = result.boxes.xyxy.tolist() if result.boxes.xyxy is not None else []
+
+        for i, cls_id in enumerate(class_ids):
+            confidence = float(confidences[i]) if i < len(confidences) else 1.0
+            if confidence < detect_conf_threshold:
+                continue
+
+            if i < len(xyxy):
+                x1, y1, x2, y2 = [float(v) for v in xyxy[i]]
+                box_w = max(x2 - x1, 0.0)
+                box_h = max(y2 - y1, 0.0)
+                area_ratio = (box_w * box_h) / image_area
+                if area_ratio < min_box_area_ratio or area_ratio > max_box_area_ratio:
+                    continue
+
             idx = int(cls_id)
             class_name = names_map.get(idx, str(idx))
-            detected_classes.append(str(class_name))
+            class_name_str = str(class_name)
+            detected_classes.append(class_name_str)
+            class_confidences.setdefault(class_name_str, []).append(confidence)
 
     counts = Counter(detected_classes)
     items: list[dict[str, Any]] = []
 
     for class_name, quantity in counts.items():
         product = _fetch_product_by_class(class_name)
+        confidences = class_confidences.get(class_name, [])
+        max_conf = max(confidences) if confidences else 0.0
+        avg_conf = sum(confidences) / len(confidences) if confidences else 0.0
+
         if product:
             unit_price = float(product.get("price", 0.0))
             display_name = product.get("display_name") or class_name
@@ -177,6 +205,8 @@ async def scan_cart(file: UploadFile = File(...)) -> JSONResponse:
                 "price": unit_price,
                 "quantity": int(quantity),
                 "line_total": round(unit_price * quantity, 2),
+                "max_confidence": round(max_conf, 4),
+                "avg_confidence": round(avg_conf, 4),
             }
         )
 

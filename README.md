@@ -91,9 +91,11 @@ npm run dev
 
 1. Hit `GET http://localhost:8000/health`.
 2. Open `http://localhost:3000` on desktop and mobile.
-3. Scan a sample basket image.
-4. Upload a PromptPay slip screenshot.
-5. Test assistant prompt: "Where is instant noodles?"
+3. Scan a sample basket image and confirm detected items in the popup.
+4. Use + and - to adjust quantities in the confirmation popup, then accept to append items.
+5. Use + and - in checkout to increase or reduce cart items.
+6. Upload a PromptPay slip screenshot.
+7. Test assistant prompt: "Where is instant noodles?"
 
 ## Notes
 
